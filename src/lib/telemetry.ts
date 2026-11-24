@@ -205,6 +205,67 @@ export function energyTotals(rows: Sample[]) {
   };
 }
 
+/* ---------- Separate AC circuit (ESP32 + ACS712 20 A + ZMPT101B) ---------- */
+export const AC_RATED_POWER_W = 15; // bulb nameplate rating, never a measurement
+
+export type AcSample = {
+  timestamp: string;
+  ac_voltage_v: number | null;
+  ac_current_a: number | null;
+  ac_power_w: number | null;
+  apparent_power_va: number | null;
+  power_factor: number | null;
+  grid_status: string | null;
+  voltage_offset_v: number | null;
+  current_offset_v: number | null;
+  raw_voltage_rms: number | null;
+  raw_current_rms: number | null;
+  /** true only when the firmware explicitly says so; null/false = uncalibrated diagnostics */
+  ac_calibrated: boolean | null;
+};
+
+const AC_KEYS = ["ac_voltage_v", "ac_current_a", "ac_power_w", "apparent_power_va", "power_factor", "raw_voltage_rms", "raw_current_rms"] as const;
+
+/**
+ * JSON.parse that tolerates common Arduino printf output: bare nan / -nan / inf / infinity
+ * values (e.g. power factor = P / S with S = 0) become null, and trailing commas are dropped.
+ * Used for the ESP32 AC link so one invalid value does not discard the whole packet.
+ */
+export function parseLenientJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const fixed = text
+      .replace(/:\s*[-+]?(nan|inf(inity)?|ovf)\b/gi, ":null")
+      .replace(/,\s*([}\]])/g, "$1");
+    return JSON.parse(fixed);
+  }
+}
+
+/** Parse one ESP32 AC packet. Accepts source:"ac_esp32" or any packet carrying AC fields. */
+export function parseAcPacket(x: unknown, timestamp = new Date().toISOString()): AcSample | null {
+  if (!x || typeof x !== "object" || Array.isArray(x)) return null;
+  const o = x as Record<string, unknown>;
+  const tagged = o.source === "ac_esp32";
+  if (!tagged && !AC_KEYS.some((k) => k in o)) return null;
+  if (!tagged && "battery_voltage_v" in o) return null; // DC packet on the wrong link
+  const gs = o.grid_status;
+  return {
+    timestamp,
+    ac_voltage_v: num(o.ac_voltage_v),
+    ac_current_a: num(o.ac_current_a),
+    ac_power_w: num(o.ac_power_w),
+    apparent_power_va: num(o.apparent_power_va),
+    power_factor: num(o.power_factor),
+    grid_status: gs === true ? "Available" : gs === false ? "Unavailable" : str(gs),
+    voltage_offset_v: num(o.voltage_offset_v),
+    current_offset_v: num(o.current_offset_v),
+    raw_voltage_rms: num(o.raw_voltage_rms),
+    raw_current_rms: num(o.raw_current_rms),
+    ac_calibrated: bool(o.ac_calibrated),
+  };
+}
+
 export const CSV_COLUMNS = [
   "timestamp", "battery_voltage_v", "battery_current_a", "battery_power_w", "battery_soc", "battery_capacity_wh",
   "pv_voltage_v", "pv_current_a", "pv_power_w", "solar_available", "load_power_w", "load_estimated",
@@ -217,22 +278,40 @@ const cell = (v: unknown) => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
+export const AC_CSV_COLUMNS = [
+  "ac_voltage_v", "ac_current_a", "ac_power_w", "apparent_power_va", "power_factor", "grid_status",
+  "voltage_offset_v", "current_offset_v", "raw_voltage_rms", "raw_current_rms", "ac_calibrated",
+] as const;
+
 /**
- * CSV with blank cells for unavailable values. When solar_available is false the PV
- * readings are exported blank (not verified). Extra columns flag provenance:
- * data_source (esp8266_sensor | browser_simulation) and battery_soc_estimated.
+ * One CSV, two independent circuits: every row is either a DC row (ESP8266 or demo)
+ * or an AC row (ESP32), identified by the `circuit` column; the other circuit's
+ * columns are left blank so readings are never paired across circuits.
+ * Blank cells = unavailable. PV readings are blank when solar_available is false.
+ * Flags: battery_soc_estimated, temperature_simulated, load_estimated, ac_calibrated, data_source.
  */
-export function toCsv(rows: Sample[]): string {
-  const header = [...CSV_COLUMNS, "battery_soc_estimated", "data_source"].join(",");
-  const lines = rows.map((r) => {
+export function toCsv(rows: Sample[], acRows: AcSample[] = []): string {
+  const header = [...CSV_COLUMNS, ...AC_CSV_COLUMNS, "battery_soc_estimated", "data_source", "circuit"].join(",");
+  const blankAc = AC_CSV_COLUMNS.map(() => "");
+  const dc = rows.map((r) => {
     const solarOk = r.solar_available !== false;
     const values = CSV_COLUMNS.map((k) => {
       if (!solarOk && (k === "pv_voltage_v" || k === "pv_current_a" || k === "pv_power_w")) return "";
       return cell(r[k]);
     });
+    values.push(...blankAc);
     values.push(r.battery_soc === null ? "" : "true");
     values.push(r.source === "sensor" ? "esp8266_sensor" : "browser_simulation");
-    return values.join(",");
+    values.push("dc");
+    return { t: r.timestamp, line: values.join(",") };
   });
+  const ac = acRows.map((r) => {
+    const values = CSV_COLUMNS.map((k) => (k === "timestamp" ? cell(r.timestamp) : ""));
+    // ac_calibrated is exported as false unless the firmware explicitly reported true
+    values.push(...AC_CSV_COLUMNS.map((k) => (k === "ac_calibrated" ? String(r.ac_calibrated === true) : cell(r[k]))));
+    values.push("", "esp32_sensor", "ac");
+    return { t: r.timestamp, line: values.join(",") };
+  });
+  const lines = [...dc, ...ac].sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0)).map((x) => x.line);
   return [header, ...lines].join("\n");
 }

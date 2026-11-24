@@ -9,7 +9,7 @@ import { useSerialLink } from "@/lib/useSerialLink";
 import {
   Sample, JsonStream, parsePacket, batteryState, isLowBattery, isOverCurrent, deriveRecommendation,
   classifyRecommendation, energyTotals, toCsv, EMS_STATES, EmsKey, NOMINAL_CAPACITY_WH, MAX_CHARGE_CURRENT_A,
-  LOW_BATTERY_VOLTAGE_V, LOW_BATTERY_SOC,
+  LOW_BATTERY_VOLTAGE_V, LOW_BATTERY_SOC, AcSample, parseAcPacket, parseLenientJson, AC_RATED_POWER_W,
 } from "@/lib/telemetry";
 
 const C = { solar: "#e89f00", battery: "#16a672", grid: "#2f7be0", pred: "#6a55e0", alert: "#e04848", warn: "#eb6834" };
@@ -142,44 +142,79 @@ function EmsPanel({ s, live }: { s: Sample | undefined; live: boolean }) {
   );
 }
 
-/** Independent ESP32 AC link. Shows raw output only; AC values are not presented as measurements. */
-function AcPanel() {
-  const [last, setLast] = useState<string | null>(null);
-  const buf = useRef("");
-  const link = useSerialLink("ESP32", {
-    onOpen: () => { buf.current = ""; setLast(null); },
-    onText: (t) => {
-      buf.current += t;
-      const lines = buf.current.split(/\r?\n/);
-      buf.current = (lines.pop() ?? "").slice(-2048);
-      const good = lines.map((l) => l.trim()).filter(Boolean);
-      if (good.length) setLast(good[good.length - 1].slice(0, 240));
-    },
-  });
+/** Independent ESP32 AC circuit. Uncalibrated readings are shown only as diagnostics. */
+type LinkApi = ReturnType<typeof useSerialLink>;
+type LinkStats = { packets: number; skipped: number; last: number };
+function AcPanel({ link, a, stats, now, raw }: { link: LinkApi; a: AcSample | undefined; stats: LinkStats; now: number; raw: string | null }) {
+  const calibrated = a?.ac_calibrated === true;
+  const readingTag: [Tone, string] = calibrated ? ["measured", "Measured"] : ["pending", "Uncalibrated"];
+  const dim = calibrated ? undefined : "#a9b6c8";
+  const stale = link.state === "open" && stats.last > 0 && now - stats.last > 5000;
+  const status = link.state === "open"
+    ? (stats.packets === 0 ? "Connected — waiting for ESP32 AC JSON at 115200 baud"
+      : stale ? `No AC data for ${Math.round((now - stats.last) / 1000)} s — check the ESP32 USB cable`
+      : `Receiving ESP32 diagnostic data · ${stats.packets} packets`)
+      + (stats.skipped ? ` · ${stats.skipped} non-AC lines skipped${stats.packets === 0 ? " (is this the ESP32 port?)" : ""}` : "")
+    : link.message === "Not connected" ? "Not connected · the AC circuit is monitored separately from the DC system" : link.message;
+  const cards: { label: string; value: string; sub?: string; tag?: [Tone, string]; accent?: string }[] = a ? [
+    { label: "AC voltage", value: f(a.ac_voltage_v, 1, "V"), sub: calibrated ? "ZMPT101B" : "ZMPT101B · unverified diagnostic", tag: readingTag, accent: dim },
+    { label: "AC current", value: f(a.ac_current_a, 3, "A"), sub: calibrated ? "ACS712 20 A" : "ACS712 20 A · unverified diagnostic", tag: readingTag, accent: dim },
+    { label: "AC power", value: f(a.ac_power_w, 2, "W"), sub: calibrated ? "Active power" : `Active power · unverified (bulb rated ${AC_RATED_POWER_W} W)`, tag: readingTag, accent: dim },
+    { label: "Voltage offset", value: f(a.voltage_offset_v, 4, "V"), sub: "ZMPT101B zero offset", tag: ["info", "Diagnostic"] },
+    { label: "Current offset", value: f(a.current_offset_v, 4, "V"), sub: "ACS712 zero offset", tag: ["info", "Diagnostic"] },
+    { label: "Apparent power", value: f(a.apparent_power_va, 2, "VA"), tag: readingTag, accent: dim },
+    { label: "Power factor", value: f(a.power_factor, 3, ""), sub: a.power_factor === null ? "Not available (e.g. no load)" : undefined, tag: readingTag, accent: dim },
+    { label: "Grid status", value: a.grid_status ?? "Unknown", sub: a.grid_status === null ? "Not reported by ESP32" : "Reported by ESP32", tag: a.grid_status === null ? ["pending", "N/A"] : ["info", "Status"] },
+    { label: "Raw voltage RMS", value: f(a.raw_voltage_rms, 4, ""), sub: "Sensor-level value before calibration", tag: ["info", "Diagnostic"] },
+    { label: "Raw current RMS", value: f(a.raw_current_rms, 4, ""), sub: "Sensor-level value before calibration", tag: ["info", "Diagnostic"] },
+  ] : [];
   return (
     <div className="rounded-xl border border-dashed border-white/15 bg-night3/60 p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="font-display text-lg text-white">Separate AC circuit</p>
-          <p className="mt-1 text-sm text-white/60">Independent of the DC system · no AC/DC transfer wiring</p>
+          <p className="mt-1 text-sm text-white/60">Independent of the DC system · no AC/DC transfer wiring · own ESP32 serial link</p>
         </div>
-        <Tag tone="estimated">Calibration pending</Tag>
+        {calibrated ? <Tag tone="measured">Calibrated</Tag> : <Tag tone="estimated">Calibration Pending — Unverified Diagnostics</Tag>}
       </div>
       <div className="mt-4 grid grid-cols-2 gap-2 text-sm sm:grid-cols-5">
         {[["Controller", "ESP32"], ["Current sensor", "ACS712 20 A"], ["Voltage sensor", "ZMPT101B"], ["Supply", "220 V AC"], ["Load", "15 W rated bulb"]].map(([k, v]) => (
           <div key={k} className="rounded-lg bg-white/5 px-3 py-2"><span className="block text-xs text-white/50">{k}</span><span className="text-white">{v}</span></div>
         ))}
       </div>
+
       <div className="mt-4 flex flex-wrap items-center gap-3">
-        <button className="rounded-full bg-white/10 px-4 py-2 text-sm hover:bg-white/15" disabled={link.state === "connecting" || link.state === "closing"} onClick={() => (link.active ? link.disconnect() : void link.connect())}>
-          {link.state === "connecting" ? "Connecting…" : link.active ? "Disconnect ESP32" : "Connect ESP32 (optional)"}
+        <button className="rounded-full bg-white px-5 py-2.5 text-sm font-medium text-night disabled:opacity-60" disabled={link.state === "connecting" || link.state === "closing"} onClick={() => (link.active ? link.disconnect() : void link.connect())}>
+          {link.state === "connecting" ? "Connecting…" : link.state === "closing" ? "Disconnecting…" : link.active ? "Disconnect ESP32 (AC)" : "Connect ESP32 (AC)"}
         </button>
-        <span className="text-xs text-white/50">{link.state === "idle" && link.message === "Not connected" ? "No live AC measurements — sensors not yet calibrated" : link.message}</span>
+        <span className={`text-xs ${stale ? "text-solar" : "text-white/60"}`} role="status">{status}</span>
       </div>
-      {last && (
-        <p className="mt-3 break-all text-xs text-white/60">
-          Raw ESP32 output (uncalibrated, not verified): <code className="font-mono text-white/80">{last}</code>
+      {!a && raw && link.state === "open" && (
+        <p className="mt-3 break-all text-xs text-white/50">Last raw line: <code className="font-mono text-white/70">{raw}</code></p>
+      )}
+
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        <div className="rounded-xl bg-night3 p-4">
+          <div className="flex items-start justify-between gap-2"><p className="text-sm text-white/60">Bulb rated power</p><Tag tone="info">Nameplate</Tag></div>
+          <p className="mt-2 font-mono text-xl text-white">{AC_RATED_POWER_W.toFixed(0)} W</p>
+          <p className="mt-1 text-xs text-white/50">Manufacturer rating — a fixed specification, not a measurement</p>
+        </div>
+        <div className="rounded-xl bg-night3 p-4">
+          <div className="flex items-start justify-between gap-2"><p className="text-sm text-white/60">Measured active power</p>{a && <Tag tone={readingTag[0]}>{readingTag[1]}</Tag>}</div>
+          <p className="mt-2 font-mono text-xl" style={{ color: dim ?? "white" }}>{a ? f(a.ac_power_w, 2, "W") : "—"}</p>
+          <p className="mt-1 text-xs text-white/50">{!a ? "No ESP32 data" : calibrated ? "From calibrated ESP32 readings" : "Uncalibrated diagnostic — not an accurate mains measurement"}</p>
+        </div>
+      </div>
+
+      {a && !calibrated && (
+        <p className="mt-3 rounded-lg bg-solar/10 px-3 py-2 text-sm text-solar">
+          Calibration Pending — Unverified Diagnostics. These ESP32 readings are uncalibrated and only for checking the sensors; they are not accurate mains measurements.
         </p>
+      )}
+      {a && (
+        <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-3">
+          {cards.map((c) => <Card key={c.label} {...c} />)}
+        </div>
       )}
     </div>
   );
@@ -243,6 +278,41 @@ export default function Dashboard() {
     },
   });
 
+  // Independent ESP32 AC link: own port, own reader, own rows. Never touches DC state.
+  const [acRows, setAcRows] = useState<AcSample[]>([]);
+  const [acStats, setAcStats] = useState({ packets: 0, skipped: 0, last: 0 });
+  const [acRaw, setAcRaw] = useState<string | null>(null);
+  const acStream = useRef(new JsonStream());
+  const acLineBuf = useRef("");
+  const ac = useSerialLink("ESP32 (AC)", {
+    onOpen: () => {
+      acStream.current.reset();
+      acLineBuf.current = "";
+      setAcRows([]);
+      setAcStats({ packets: 0, skipped: 0, last: 0 });
+      setAcRaw(null);
+    },
+    onText: (text) => {
+      // keep the last raw line for troubleshooting before the first valid packet
+      acLineBuf.current += text;
+      const lines = acLineBuf.current.split(/\r?\n/);
+      acLineBuf.current = (lines.pop() ?? "").slice(-2048);
+      const lastLine = lines.map((l) => l.trim()).filter(Boolean).pop();
+      if (lastLine) setAcRaw(lastLine.slice(0, 240));
+      const fresh: AcSample[] = [];
+      let skipped = 0;
+      for (const obj of acStream.current.push(text)) {
+        try {
+          const a = parseAcPacket(parseLenientJson(obj));
+          if (a) fresh.push(a); else skipped++;
+        } catch { skipped++; }
+      }
+      if (fresh.length) setAcRows((r) => [...r, ...fresh].slice(-MAX_ROWS));
+      if (fresh.length || skipped) setAcStats((st) => ({ packets: st.packets + fresh.length, skipped: st.skipped + skipped, last: fresh.length ? Date.now() : st.last }));
+    },
+  });
+  const acLast = acRows[acRows.length - 1];
+
   // Simulated demo ticks (only in demo mode).
   useEffect(() => {
     if (mode !== "demo") return;
@@ -254,10 +324,10 @@ export default function Dashboard() {
 
   // Clock for stale-data detection while connected.
   useEffect(() => {
-    if (esp.state !== "open") return;
+    if (esp.state !== "open" && ac.state !== "open") return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [esp.state]);
+  }, [esp.state, ac.state]);
 
   const live = mode === "live";
   const s = rows[rows.length - 1];
@@ -282,8 +352,8 @@ export default function Dashboard() {
   }
 
   function download() {
-    if (!rows.length) return;
-    const url = URL.createObjectURL(new Blob([toCsv(rows)], { type: "text/csv" }));
+    if (!rows.length && !acRows.length) return;
+    const url = URL.createObjectURL(new Blob([toCsv(rows, acRows)], { type: "text/csv" }));
     const a = document.createElement("a");
     a.href = url;
     a.download = `prototype-${live ? "live-sensor" : "simulated-demo"}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
@@ -354,7 +424,8 @@ export default function Dashboard() {
 
               <div className="mt-5">
                 <Flow solar={s?.pv_power_w ?? null} battery={s?.battery_power_w ?? null} load={s?.load_power_w ?? null} voltage={s?.battery_voltage_v ?? null}
-                  state={s ? st : null} solarAvailable={s?.solar_available ?? null} loadEstimated={s?.load_estimated ?? false} soc={s?.battery_soc ?? null} />
+                  state={s ? st : null} solarAvailable={s?.solar_available ?? null} loadEstimated={s?.load_estimated ?? false} soc={s?.battery_soc ?? null}
+                  acNote={acLast?.ac_calibrated === true ? "Calibrated · independent" : ac.state === "open" ? "ESP32 linked · uncalibrated" : "Calibration pending · independent"} />
               </div>
 
               <div className="mt-6 grid gap-4 lg:grid-cols-2">
@@ -393,11 +464,11 @@ export default function Dashboard() {
                 {cards.map((c) => <Card key={c.label} {...c} />)}
               </div>
 
-              <div className="mt-4"><AcPanel /></div>
+              <div className="mt-4"><AcPanel link={ac} a={acLast} stats={acStats} now={now} raw={acRaw} /></div>
 
               <div className="mt-5 flex flex-wrap items-center gap-3">
-                <button className="rounded-full bg-white/10 px-5 py-2 disabled:opacity-50" disabled={!rows.length} onClick={download}>Download {live ? "live sensor" : "simulated demo"} CSV</button>
-                <span className="text-xs text-white/50">{rows.length} samples · blank cells = unavailable · includes simulated/estimated flags{live ? "" : " · demo data only, never mixed with sensor data"}</span>
+                <button className="rounded-full bg-white/10 px-5 py-2 disabled:opacity-50" disabled={!rows.length && !acRows.length} onClick={download}>Download {live ? "live sensor" : "simulated demo"} CSV</button>
+                <span className="text-xs text-white/50">{rows.length} DC samples{acRows.length ? ` · ${acRows.length} AC rows (separate circuit column)` : ""} · blank cells = unavailable · includes simulated/estimated/ac_calibrated flags{live ? "" : " · demo data only, never mixed with sensor data"}</span>
               </div>
             </div>
           </div>
