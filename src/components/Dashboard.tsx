@@ -1,175 +1,26 @@
 "use client";
-
-import { MotionConfig, motion, useReducedMotion } from "motion/react";
-import { useCallback, useMemo, useState } from "react";
-import { H, LSTM, N, TARIFF, inr, metrics, num } from "@/lib/data";
-import Battery from "./Battery";
-import CostEnergy from "./CostEnergy";
-import Forecast from "./Forecast";
-import LoadSolar from "./LoadSolar";
+import { useEffect, useRef, useState } from "react";
+import { MotionConfig, motion } from "motion/react";
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 import Nav from "./Nav";
-import { Cases, Results } from "./ResultsCases";
-import Simulator from "./Simulator";
-import { Section } from "./ui";
-
-
-const INSTITUTION = "Thapar Institute of Engineering and Technology, Patiala";
-const TEAM = "Aryan Bharadwaj,Tarun Garg,Moksh,Nikunj Garg,Kusham Lata"; 
-const GUIDE = "Dr. HemDutt Joshi"; 
-
-function firstMiddayHour() {
-  for (let i = 0; i < N; i++) if (H.case[i] === 1 && H.chPv[i] > 0.2) return i;
-  return 12;
-}
-
-export default function Dashboard() {
-  const [hour, setHourState] = useState(firstMiddayHour);
-  const setHour = useCallback((h: number) => setHourState(h), []);
-  const reduce = useReducedMotion();
-
-  const jumpTo = useCallback((h: number) => {
-    setHourState(h);
-    document.getElementById("simulator")?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
-  }, [reduce]);
-
-  return (
-    <MotionConfig reducedMotion="user">
-      <Nav />
-      <main>
-        <div id="hero" className="relative overflow-hidden bg-night text-white">
-          <div
-            aria-hidden
-            className="pointer-events-none absolute -top-40 left-1/2 h-[520px] w-[1100px] -translate-x-1/2 rounded-full opacity-40 blur-3xl"
-            style={{ background: "radial-gradient(closest-side, rgba(232,159,0,0.35), rgba(47,123,224,0.18), transparent)" }}
-          />
-          <div className="relative mx-auto max-w-[1200px] px-4 pb-16 pt-28 sm:px-8 sm:pt-32">
-            <motion.div
-              initial={{ opacity: 0, y: 18 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.7, ease: [0.16, 1, 0.3, 1] }}
-              className="max-w-[820px]"
-            >
-              <h1 className="font-display text-[2.6rem] font-semibold leading-[1.02] tracking-[-0.035em] sm:text-[4.2rem]">
-                Smart Energy Management System
-              </h1>
-              <p className="mt-5 max-w-[60ch] text-[1.1rem] leading-relaxed text-white/75">
-                Rooftop solar, a 1.2 kWh battery and the utility grid, coordinated hour by hour by an IoT controller. LSTM networks forecast load, solar output and cost. Press play to watch a month of the house run.
-              </p>
-              {(TEAM || GUIDE) && (
-                <p className="mt-4 text-sm text-white/55">
-                  {TEAM && <>Team: {TEAM}</>}
-                  {TEAM && GUIDE && <span className="mx-3 text-white/25">|</span>}
-                  {GUIDE && <>Guide: {GUIDE}</>}
-                </p>
-              )}
-            </motion.div>
-            <motion.div
-              id="simulator"
-              className="mt-12 scroll-mt-20"
-              initial={{ opacity: 0, y: 30 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.8, delay: 0.15, ease: [0.16, 1, 0.3, 1] }}
-            >
-              <Simulator hour={hour} setHour={setHour} />
-            </motion.div>
-          </div>
-        </div>
-
-        <Results />
-        <div className="border-t border-line" />
-        <Cases jumpTo={jumpTo} />
-        <div className="border-t border-line" />
-        <CostEnergy />
-        <div className="border-t border-line" />
-        <Battery />
-        <div className="border-t border-line" />
-        <LoadSolar />
-        <div className="border-t border-line" />
-        <Forecast />
-        <Conclusion />
-      </main>
-      <Footer />
-    </MotionConfig>
-  );
-}
-
-function Conclusion() {
-  const m = useMemo(() => metrics(), []);
-  const cols = [
-    {
-      title: "What the results show",
-      items: [
-        `The monthly bill fell from ${inr(m.costWo, 2)} to ${inr(m.costW, 2)}, a saving of ${inr(m.saved, 2)} (${m.savedPct.toFixed(1)}%).`,
-        `Solar and the battery supplied ${m.selfShare.toFixed(1)}% of the household load.`,
-        `${m.chPvShare.toFixed(1)}% of battery charging came free from solar. Grid charging cost ${inr(m.chGrid * TARIFF)}.`,
-        `On unseen hours the LSTM models reached R² of ${LSTM.load.r2.toFixed(2)} for load, ${LSTM.pv.r2.toFixed(2)} for solar and ${LSTM.cost.r2.toFixed(2)} for cost.`,
-      ],
-    },
-    {
-      title: "Limitations",
-      items: [
-        "The data is a simulated month. Results from the real hardware may differ.",
-        `The 1.2 kWh battery could not cover ${m.unmetHours} outage hours, leaving ${num(m.unmet)} kWh unserved.`,
-        `With export disabled, ${num((100 * m.spill) / m.pv)}% of solar energy was lost while the battery was full.`,
-        "Forecast accuracy is moderate. One month is a small training set.",
-      ],
-    },
-    {
-      title: "Next steps",
-      items: [
-        "Replace the sample data with readings from the IoT hardware.",
-        "Size the battery against the observed outage hours.",
-        "Compare against a net metering option for surplus solar.",
-        "Forecast several hours ahead so the controller can plan battery charging in advance.",
-      ],
-    },
-  ];
-  return (
-    <div className="bg-night text-white">
-      <Section id="conclusion" title="Conclusion" dark>
-        <div className="-mt-2 grid gap-10 md:grid-cols-3">
-          {cols.map((c, k) => (
-            <motion.div
-              key={c.title}
-              initial={{ opacity: 0, y: 16 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true, margin: "-80px" }}
-              transition={{ duration: 0.6, delay: k * 0.12 }}
-            >
-              <h3 className="border-b border-white/15 pb-3 font-display text-xl font-semibold">{c.title}</h3>
-              <ul className="mt-4 space-y-3">
-                {c.items.map((it) => (
-                  <li key={it} className="flex gap-3 text-[0.98rem] leading-relaxed text-white/75">
-                    <span className="mt-[0.6em] h-1.5 w-1.5 shrink-0 rounded-full bg-solar" />
-                    {it}
-                  </li>
-                ))}
-              </ul>
-            </motion.div>
-          ))}
-        </div>
-      </Section>
-    </div>
-  );
-}
-
-function Footer() {
-  return (
-    <footer className="border-t border-white/10 bg-night text-white/55">
-      <div className="mx-auto flex max-w-[1200px] flex-col gap-4 px-4 py-10 text-sm sm:flex-row sm:items-center sm:justify-between sm:px-8">
-        <div>
-          Smart Energy Management System. {INSTITUTION}.
-          <br />
-          Data: {N} simulated hourly readings, one month. Tariff ₹{TARIFF} per kWh.
-        </div>
-        <a
-          href="/data/smart_meter_clean.csv"
-          download
-          className="inline-flex h-10 items-center justify-center rounded-full bg-white/10 px-5 font-medium text-white ring-1 ring-white/15 transition hover:bg-white/15"
-        >
-          Download the dataset (CSV)
-        </a>
-      </div>
-    </footer>
-  );
+import History, {Flow} from "./History";
+import { Section, Panel, PanelTitle, Legend, axisProps } from "./ui";
+type Sample = {timestamp:string; battery_voltage_v:number; battery_current_a:number; pv_voltage_v:number; pv_current_a:number; temperature_c:number; load_power_w:number|null; source:string};
+type Port = {open:(x:{baudRate:number})=>Promise<void>; readable:ReadableStream<Uint8Array>|null; close:()=>Promise<void>};
+const demo=(sun:number,bulb:boolean,t:number):Sample=>{const pv=Math.max(0,Math.min(12,sun/100*12*(0.95+0.05*Math.sin(t/7))));const load=bulb?5:0;const current=(pv*.85-load-.15)/12.6;return {timestamp:new Date().toISOString(),battery_voltage_v:12.6+current*.15,battery_current_a:current,pv_voltage_v:sun>0?17:0,pv_current_a:pv/17,temperature_c:27+.3*Math.sin(t/30),load_power_w:load,source:"simulated"}};
+const pv=(s:Sample)=>s.pv_voltage_v*s.pv_current_a;
+const bat=(s:Sample)=>s.battery_voltage_v*s.battery_current_a;
+const fmt=(n:number|null|undefined,u:string)=>n==null?"—":`${n.toFixed(2)} ${u}`;
+export default function Dashboard(){
+ const [sun,setSun]=useState(70),[bulb,setBulb]=useState(true),[mode,setMode]=useState<"demo"|"live">("demo"),[rows,setRows]=useState<Sample[]>([]),[status,setStatus]=useState("No hardware connected"),[tariff]=useState(7);const stop=useRef(false),active=useRef(false),readerRef=useRef<ReadableStreamDefaultReader<Uint8Array>|null>(null);
+ useEffect(()=>{if(mode!=="demo")return;const add=()=>setRows(r=>[...r,demo(sun,bulb,Date.now()/1000)].slice(-3600));add();const id=setInterval(add,1000);return()=>clearInterval(id)},[sun,bulb,mode]);
+ async function connect(){if(active.current)return;const serial=(navigator as unknown as {serial?:{requestPort:()=>Promise<Port>}}).serial;if(!serial){setStatus("Web Serial unavailable. Use desktop Chrome or Edge over HTTPS or localhost.");return;}let port:Port|undefined;active.current=true;stop.current=false;try{port=await serial.requestPort();await port.open({baudRate:115200});setRows([]);setMode("live");setStatus("Waiting for ESP8266 sensor data");const reader=port.readable?.getReader();if(!reader)throw Error("No readable port");readerRef.current=reader;let buffer="";const decoder=new TextDecoder();try{while(!stop.current){const {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const lines=buffer.split(/\r?\n/);buffer=lines.pop()||"";for(const line of lines){try{const x=JSON.parse(line);const keys=["battery_voltage_v","battery_current_a","pv_voltage_v","pv_current_a","temperature_c"];if(!keys.every(k=>typeof x[k]==="number"&&Number.isFinite(x[k])))continue;const s:Sample={timestamp:new Date().toISOString(),battery_voltage_v:x.battery_voltage_v,battery_current_a:x.battery_current_a,pv_voltage_v:x.pv_voltage_v,pv_current_a:x.pv_current_a,temperature_c:x.temperature_c,load_power_w:typeof x.load_power_w==="number"&&Number.isFinite(x.load_power_w)?x.load_power_w:null,source:"sensor"};setRows(r=>[...r,s].slice(-3600));setStatus("Receiving sensor data");}catch{}}}}finally{readerRef.current=null;reader.releaseLock();}}catch(e){setStatus(String(e));}finally{if(port)try{await port.close()}catch{}active.current=false;setStatus(prev=>prev==="Receiving sensor data"?"Serial disconnected":prev);}}
+ const s=rows[rows.length-1];const p=s?pv(s):null,b=s?bat(s):null;const series=rows.slice(-120).map((r,i)=>({i,solar:pv(r),battery:bat(r),load:r.load_power_w,voltage:r.battery_voltage_v}));const energy=rows.slice(1).reduce((sum,r,i)=>{const dt=(Date.parse(r.timestamp)-Date.parse(rows[i].timestamp))/3600000;return sum+(dt>0&&dt<5/3600?pv(rows[i])*dt:0)},0);const loadEnergy=rows.slice(1).reduce((sum,r,i)=>{const dt=(Date.parse(r.timestamp)-Date.parse(rows[i].timestamp))/3600000;return sum+(dt>0&&dt<5/3600?(rows[i].load_power_w??0)*dt:0)},0);const loadKnown=rows.length>0&&rows.every(r=>r.load_power_w!==null);
+ function download(){if(!rows.length)return;const keys=Object.keys(rows[0]) as (keyof Sample)[];const csv=[keys.join(","),...rows.map(r=>keys.map(k=>r[k]??"").join(","))].join("\n");const url=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));const a=document.createElement("a");a.href=url;a.download=`prototype-${mode}.csv`;a.click();URL.revokeObjectURL(url)}
+ const chart=(keys:{key:string;label:string;color:string}[]) => <><Legend items={keys.map(k=>({label:k.label,color:k.color}))}/><div className="h-64"><ResponsiveContainer width="100%" height="100%"><LineChart data={series}><CartesianGrid stroke="#e3e8ef" vertical={false}/><XAxis dataKey="i" {...axisProps}/><YAxis {...axisProps}/><Tooltip/>{keys.map(k=><Line key={k.key} name={k.label} dataKey={k.key} stroke={k.color} strokeWidth={2} dot={false} isAnimationActive={false}/>)}</LineChart></ResponsiveContainer></div></>;
+ const stats=[["Battery voltage",fmt(s?.battery_voltage_v,"V")],["Battery current",fmt(s?.battery_current_a,"A")],["Solar generation",fmt(p,"W")],["DC load",fmt(s?.load_power_w,"W")],["Temperature",fmt(s?.temperature_c,"°C")],["Battery state",b==null?"—":b>.1?"Charging":b<-.1?"Discharging":"Idle"]];
+ return <MotionConfig reducedMotion="user"><Nav/><main><div id="hero" className="relative overflow-hidden bg-night text-white"><div className="pointer-events-none absolute -top-40 left-1/2 h-[520px] w-[1100px] -translate-x-1/2 rounded-full opacity-40 blur-3xl" style={{background:"radial-gradient(closest-side, rgba(232,159,0,0.35), rgba(47,123,224,0.18), transparent)"}}/><div className="relative mx-auto max-w-[1200px] px-4 pb-16 pt-28 sm:px-8 sm:pt-32"><motion.h1 initial={{opacity:0,y:18}} animate={{opacity:1,y:0}} className="max-w-[820px] font-display text-[2.6rem] font-semibold leading-[1.02] tracking-[-0.035em] sm:text-[4.2rem]">Smart Energy Management System</motion.h1><p className="mt-5 max-w-[60ch] text-[1.1rem] leading-relaxed text-white/75">Physical prototype · 50W solar panel, 12V 5.5Ah battery bank and ESP8266 sensor monitoring.</p><a className="mt-4 inline-block text-solar underline" href="https://smart-energy-management-three.vercel.app/">Household-scale simulation ↗</a><div id="simulator" className="mt-12 rounded-2xl bg-night2 p-5 ring-1 ring-white/10 sm:p-8"><div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-display text-2xl">Prototype simulator</h2><span className="rounded-full bg-white/10 px-4 py-2 text-sm">{mode==="demo"?"Simulated demo — not measured":"Sensor mode"}</span></div><div className="mt-5"><Flow solar={p} battery={b} load={s?.load_power_w??null} voltage={s?.battery_voltage_v??null}/></div><div className="mt-6 grid gap-5 sm:grid-cols-3"><label>Sunlight {sun}%<input disabled={mode==="live"} className="mt-3 block w-full accent-solar" type="range" min="0" max="100" value={sun} onChange={e=>setSun(+e.target.value)}/></label><button disabled={mode==="live"} className="rounded-full bg-white/10 p-3" onClick={()=>setBulb(!bulb)}>Virtual DC bulb: {bulb?"ON":"OFF"}</button><button className="rounded-full bg-white px-4 py-2 font-medium text-night" onClick={()=>{if(active.current){stop.current=true;void readerRef.current?.cancel();setStatus("Disconnecting");}else if(mode==="live"){setRows([]);setMode("demo");setStatus("No hardware connected");}else void connect();}}>{mode==="live"?(active.current?"Disconnect ESP8266":"Return to demo"):"Connect ESP8266"}</button></div><p className="mt-3 text-sm text-white/60">{status}</p><div className="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-3">{stats.map(([name,value])=><div key={name} className="rounded-xl bg-night3 p-4"><p className="text-sm text-white/60">{name}</p><p className="mt-2 font-mono text-xl text-white">{value}</p></div>)}</div><button className="mt-5 rounded-full bg-white/10 px-5 py-2" onClick={download}>Download {mode} CSV</button></div></div></div>
+ <div className="mx-auto max-w-[1200px] px-4 py-8 sm:px-8"><Panel><PanelTitle sub={mode==="demo"?"Current simulated session, separate from monthly synthetic analysis":"USB sensor session — only received records"}>Session monitoring</PanelTitle>{chart([{key:"solar",label:"PV power",color:"#e89f00"},{key:"battery",label:"Signed battery power",color:"#16a672"},{key:"load",label:"DC load",color:"#2f7be0"}])}<div className="mt-4 grid gap-4 sm:grid-cols-3 text-sm"><div>PV energy (retained samples)<br/><b className="font-mono text-xl">{energy.toFixed(4)} Wh</b></div><div>DC load energy<br/><b className="font-mono text-xl">{loadKnown?loadEnergy.toFixed(4)+" Wh":"Unavailable"}</b></div><div>Grid-only equivalent<br/><b className="font-mono text-xl">{loadKnown?"₹"+(loadEnergy*tariff/1000).toFixed(5):"Unavailable"}</b></div></div></Panel></div>
+ <History/>
+ <div className="bg-night text-white"><Section id="conclusion" title="Conclusion" dark><p className="max-w-[75ch] text-white/75">This scaled hardware prototype validates sensor acquisition separately from the household-scale simulation. The historical charts and LSTM evaluation use explicitly synthetic prototype-scale data. Live measurements remain separate. Grid charging, automatic source transfer and calibrated physical SOC are not implemented.</p></Section></div></main><footer className="bg-night px-8 py-8 text-sm text-white/60">Smart Energy Management System · Prototype companion · <button onClick={download} className="underline">Download CSV</button></footer></MotionConfig>
 }
