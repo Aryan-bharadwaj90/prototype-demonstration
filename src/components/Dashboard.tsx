@@ -6,15 +6,17 @@ import Nav from "./Nav";
 import History, { Flow } from "./History";
 import { Section, Panel, PanelTitle, axisProps } from "./ui";
 import { useSerialLink } from "@/lib/useSerialLink";
+import { useRecorder } from "@/lib/useRecorder";
+import { DATASETS, DatasetKey, INTERVAL_OPTIONS, MAX_SAMPLE_OPTIONS, ImportedDataset, importSyntheticCsv } from "@/lib/recorder";
 import {
   Sample, JsonStream, parsePacket, batteryState, isLowBattery, isOverCurrent, deriveRecommendation,
-  classifyRecommendation, energyTotals, toCsv, EMS_STATES, EmsKey, NOMINAL_CAPACITY_WH, MAX_CHARGE_CURRENT_A,
+  classifyRecommendation, energyTotals, EMS_STATES, EmsKey, NOMINAL_CAPACITY_WH, MAX_CHARGE_CURRENT_A,
   LOW_BATTERY_VOLTAGE_V, LOW_BATTERY_SOC, AcRow, AcSimState, AcCalibration, parseAcPacket, parseLenientJson,
   acRowFromSensor, acSimRow, validateCalibration, loadCalibration, saveCalibration, DEFAULT_CALIBRATION, AC_RATED_POWER_W,
 } from "@/lib/telemetry";
 
 const C = { solar: "#e89f00", battery: "#16a672", grid: "#2f7be0", pred: "#6a55e0", alert: "#e04848", warn: "#eb6834", sim: "#b3a6ff", off: "#7d8ba0" };
-const MAX_ROWS = 3600; // retained for CSV export
+const MAX_ROWS = 3600; // live display buffer (energy integration, calibration) — CSV data comes only from the recorder
 const CHART_ROWS = 120; // rolling window for live graphs
 const STALE_MS = 5000;
 const f = (v: number | null | undefined, d: number, u: string) => (v === null || v === undefined ? "—" : `${v.toFixed(d)}${u ? ` ${u}` : ""}`);
@@ -324,6 +326,152 @@ function AcPanel(props: {
   );
 }
 
+/* ---------- Explicit data recording & CSV export ---------- */
+type RecorderApi = ReturnType<typeof useRecorder>;
+const REC_STATUS = {
+  idle: { label: "Not recording", color: C.off },
+  recording: { label: "Recording", color: C.alert },
+  paused: { label: "Paused", color: C.solar },
+  stopped: { label: "Stopped", color: C.off },
+} as const;
+const hms = (ms: number) => {
+  const t = Math.floor(ms / 1000);
+  return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60].map((n) => String(n).padStart(2, "0")).join(":");
+};
+const selectCls = "mt-1 block rounded-lg bg-night px-3 py-2 text-sm text-white ring-1 ring-white/15 disabled:opacity-50";
+
+function RecorderPanel({ r, active, imported, onImported }: {
+  r: RecorderApi; active: Record<DatasetKey, boolean>; imported: ImportedDataset | null; onImported: (d: ImportedDataset | null) => void;
+}) {
+  const { rec, now } = r;
+  const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const st = REC_STATUS[rec.status];
+  const running = rec.status === "recording" || rec.status === "paused";
+  const total = rec.total();
+  const recordingFrom = DATASETS.filter((d) => rec.selected[d.key] && active[d.key]).map((d) => d.label);
+
+  function download(key: DatasetKey) {
+    const d = DATASETS.find((x) => x.key === key)!;
+    if (!rec.count(key)) return;
+    const url = URL.createObjectURL(new Blob([rec.csv(key)], { type: "text/csv" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `prototype-${d.file}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  function clearAll() {
+    const parts = DATASETS.filter((d) => rec.count(d.key)).map((d) => `${d.label}: ${rec.count(d.key).toLocaleString()}`);
+    if (!parts.length) return;
+    if (window.confirm(`Delete all recorded samples?\n\n${parts.join("\n")}\n\nDownload anything you need first. This cannot be undone.`)) r.clear();
+  }
+  async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (file.size > 10 * 1024 * 1024) { setImportMsg({ ok: false, text: "Not imported: files over 10 MB are not supported." }); return; }
+    const res = importSyntheticCsv(await file.text(), file.name);
+    if (!res.ok) { setImportMsg({ ok: false, text: res.error }); return; }
+    onImported(res.dataset);
+    setImportMsg({ ok: true, text: `Imported ${res.dataset.rows.toLocaleString()} synthetic rows (${res.dataset.dcRows.toLocaleString()} DC, ${res.dataset.acRows.toLocaleString()} AC). Shown in the charts below; never added to the recorded datasets.` });
+  }
+
+  const rowStatus = (k: DatasetKey) =>
+    !rec.selected[k] ? "Not selected"
+    : rec.count(k) >= rec.maxSamples ? "Limit reached"
+    : rec.status === "recording" ? (active[k] ? "Recording" : "Waiting for source")
+    : rec.status === "paused" ? "Paused"
+    : active[k] ? "Source running" : "Source off";
+
+  return (
+    <div id="recorder" className="scroll-mt-24 rounded-xl bg-night3/60 p-5 ring-1 ring-white/10">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-display text-lg text-white">Data recording &amp; CSV export</p>
+          <p className="mt-1 text-sm text-white/60">Off by default. The dashboard keeps updating; samples are added to a dataset only while recording.</p>
+        </div>
+        <span className="inline-flex items-center gap-2 rounded-full bg-white/5 px-3 py-1.5 text-xs font-medium ring-1 ring-white/10" style={{ color: st.color }} role="status">
+          <span className={`h-2 w-2 rounded-full ${rec.status === "recording" ? "animate-pulse" : ""}`} style={{ background: st.color }} />{st.label}
+        </span>
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-end gap-3">
+        {!running && <button className="rounded-full bg-white px-5 py-2 text-sm font-medium text-night" onClick={r.start}>Start recording</button>}
+        {rec.status === "recording" && <button className="rounded-full bg-white px-5 py-2 text-sm font-medium text-night" onClick={r.pause}>Pause recording</button>}
+        {rec.status === "paused" && <button className="rounded-full bg-white px-5 py-2 text-sm font-medium text-night" onClick={r.resume}>Resume recording</button>}
+        {running && <button className={smallBtn} onClick={r.stop}>Stop recording</button>}
+        <button className={smallBtn} disabled={running || !total} onClick={clearAll} title={running ? "Stop recording first" : undefined}>Clear recorded data…</button>
+        <label className="text-xs text-white/60">Interval
+          <select className={selectCls} disabled={!rec.editable} value={rec.intervalS} onChange={(e) => r.setIntervalS(Number(e.target.value))}>
+            {INTERVAL_OPTIONS.map((s) => <option key={s} value={s}>{s === 60 ? "60 s (1 min)" : `${s} s`}</option>)}
+          </select>
+        </label>
+        <label className="text-xs text-white/60">Max samples per dataset
+          <select className={selectCls} disabled={!rec.editable} value={rec.maxSamples} onChange={(e) => r.setMax(Number(e.target.value))}>
+            {MAX_SAMPLE_OPTIONS.map((n) => <option key={n} value={n}>{n.toLocaleString()}</option>)}
+          </select>
+        </label>
+      </div>
+
+      <div className="mt-3 grid gap-x-6 gap-y-1 text-sm text-white/70 sm:grid-cols-3">
+        <p>Duration <b className="font-mono text-white">{hms(rec.durationMs(now))}</b></p>
+        <p>Recorded samples <b className="font-mono text-white">{total.toLocaleString()}</b></p>
+        <p>Source{recordingFrom.length === 1 ? "" : "s"} <b className="text-white">{rec.status === "recording" || rec.status === "paused" ? (recordingFrom.join(" + ") || "none active") : "—"}</b></p>
+      </div>
+      {rec.message && <p className="mt-2 rounded-lg bg-solar/10 px-3 py-2 text-sm text-solar" role="alert">{rec.message}</p>}
+      {!rec.editable && <p className="mt-1 text-xs text-white/40">Interval, limit and dataset selection can be changed after stopping.</p>}
+
+      <div className="mt-4 grid gap-2">
+        {DATASETS.map((d) => {
+          const n = rec.count(d.key), rs = rowStatus(d.key);
+          return (
+            <div key={d.key} className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg bg-white/5 px-3 py-2.5">
+              <label className="flex min-w-[220px] flex-1 items-start gap-2.5">
+                <input type="checkbox" className="mt-1 accent-solar" checked={rec.selected[d.key]} disabled={!rec.editable} onChange={() => r.toggle(d.key)} />
+                <span>
+                  <span className="mr-2 text-sm text-white">{d.label}</span>
+                  <Tag tone={d.source === "sensor" ? (d.circuit === "ac" ? "estimated" : "measured") : "simulated"}>{d.source === "sensor" ? (d.circuit === "ac" ? "Live · diagnostic/calibrated" : "Live · measured") : "Simulated"}</Tag>
+                  <span className="block text-xs text-white/45">{d.note}</span>
+                </span>
+              </label>
+              <span className={`w-36 text-xs ${rs === "Recording" ? "text-[#ff9b9b]" : rs === "Limit reached" ? "text-solar" : "text-white/50"}`}>{rs}</span>
+              <span className="w-32 font-mono text-sm text-white tnum">{n.toLocaleString()} <span className="text-white/40">/ {rec.maxSamples.toLocaleString()}</span></span>
+              <button className={smallBtn} disabled={!n} onClick={() => download(d.key)}>Download CSV</button>
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-xs text-white/45">
+        One reading per interval, taken only from real new readings — gaps stay gaps and nothing is generated to fill them. Recording stops automatically when any dataset reaches the limit.
+        Each dataset exports to its own file, so live and simulated data never share a CSV. Recorded data is kept after a board disconnects or recording stops, until you clear it or reload the page.
+      </p>
+
+      <details className="mt-3 rounded-xl bg-white/5 px-4 py-3">
+        <summary className="cursor-pointer select-none text-sm text-white/80">
+          Import synthetic test CSV <span className="text-white/40">· optional{imported ? ` · loaded: ${imported.name}` : ""}</span>
+        </summary>
+        <p className="mt-2 text-xs text-white/60">
+          For testing the charts with prepared data. The file needs a <code className="font-mono">data_source</code> column and every row must be labelled synthetic
+          (synthetic, synthetic_test, browser_simulation or simulated). Files containing sensor-labelled rows are rejected. Imported data is kept apart from all recorded datasets and is never exported as measured.
+        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <label className={`${smallBtn} cursor-pointer`}>
+            Choose CSV file…<input type="file" accept=".csv,text/csv" className="sr-only" onChange={(e) => void onFile(e)} />
+          </label>
+          {imported && <button className={smallBtn} onClick={() => { onImported(null); setImportMsg(null); }}>Remove imported data</button>}
+        </div>
+        {imported && (
+          <p className="mt-2 text-xs text-white/60">
+            <Tag tone="simulated">Synthetic test data</Tag> {imported.name} · {imported.rows.toLocaleString()} rows · labels {imported.labels.join(", ")}
+            {imported.first && ` · ${imported.first} → ${imported.last}`}
+          </p>
+        )}
+        {importMsg && <p className={`mt-2 text-xs ${importMsg.ok ? "text-battery" : "text-[#ff9b9b]"}`}>{importMsg.text}</p>}
+      </details>
+    </div>
+  );
+}
+
 function MiniChart({ title, data, dataKey, color, unit, limit: refLine, domain, note }: {
   title: string; data: object[]; dataKey: string; color: string; unit: string;
   limit?: { y: number; label: string }; domain?: [number | "auto", number | "auto"]; note?: string;
@@ -361,6 +509,10 @@ export default function Dashboard() {
   const [tariff] = useState(7);
   const demo = useRef<DemoState>(newDemo());
   const stream = useRef(new JsonStream());
+  const recorder = useRecorder();
+  const { offer } = recorder;
+  const [imported, setImported] = useState<ImportedDataset | null>(null);
+  const [chartView, setChartView] = useState<"session" | "imported">("session");
 
   const esp = useSerialLink("ESP8266", {
     onOpen: () => {
@@ -377,6 +529,7 @@ export default function Dashboard() {
           if (s) fresh.push(s); else skipped++;
         } catch { skipped++; }
       }
+      for (const x of fresh) offer("dc_live", x);
       if (fresh.length) setLiveRows((r) => [...r, ...fresh].slice(-MAX_ROWS));
       if (fresh.length || skipped) setStats((st) => ({ packets: st.packets + fresh.length, skipped: st.skipped + skipped, last: fresh.length ? Date.now() : st.last }));
     },
@@ -428,29 +581,31 @@ export default function Dashboard() {
           if (a) fresh.push(acRowFromSensor(a, calRef.current, integrateAc)); else skipped++;
         } catch { skipped++; }
       }
+      for (const x of fresh) offer("ac_live", x);
       if (fresh.length) setAcLive((r) => [...r, ...fresh].slice(-MAX_ROWS));
       if (fresh.length || skipped) setAcStats((st) => ({ packets: st.packets + fresh.length, skipped: st.skipped + skipped, last: fresh.length ? Date.now() : st.last }));
     },
   });
 
-  // Simulated DC demo ticks (only in demo mode).
+  // Simulated DC demo ticks (only in demo mode). The display buffer is a rolling chart window;
+  // rows reach a dataset only through offer(), which ignores them unless recording is on.
   useEffect(() => {
     if (mode !== "demo") return;
-    const add = () => { const s = demoSample(sun, bulb, demo.current); setDemoRows((r) => [...r, s].slice(-MAX_ROWS)); };
+    const add = () => { const s = demoSample(sun, bulb, demo.current); offer("dc_sim", s); setDemoRows((r) => [...r, s].slice(-CHART_ROWS)); };
     add();
     const id = setInterval(add, 1000);
     return () => clearInterval(id);
-  }, [sun, bulb, mode]);
+  }, [sun, bulb, mode, offer]);
 
   // Simulated AC ticks (only while AC simulation is on).
   useEffect(() => {
     if (!acSim) return;
     const simState = acSimState.current;
-    const add = () => { const r = acSimRow(acSimBulb, simState); setAcSimRows((rows) => [...rows, r].slice(-MAX_ROWS)); };
+    const add = () => { const r = acSimRow(acSimBulb, simState); offer("ac_sim", r); setAcSimRows((rows) => [...rows, r].slice(-CHART_ROWS)); };
     add();
     const id = setInterval(add, 1000);
     return () => { clearInterval(id); simState.last = 0; };
-  }, [acSim, acSimBulb]);
+  }, [acSim, acSimBulb, offer]);
 
   // Clock for stale-data detection while a link is open.
   useEffect(() => {
@@ -503,24 +658,13 @@ export default function Dashboard() {
     setMode("demo");
   }
 
-  /** Live sensor data and simulated data always go to separate files. */
-  function download(kind: "live" | "sim") {
-    const dc = kind === "live" ? liveRows : demoRows;
-    const acr = kind === "live" ? acLive : acSimRows;
-    if (!dc.length && !acr.length) return;
-    const url = URL.createObjectURL(new Blob([toCsv(dc, acr)], { type: "text/csv" }));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `prototype-${kind === "live" ? "live-sensor" : "simulated"}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  const series = rows.slice(-CHART_ROWS).map((r) => ({
+  const showImported = chartView === "imported" && !!imported;
+  const series = showImported ? imported.series : rows.slice(-CHART_ROWS).map((r) => ({
     t: timeOf(r.timestamp),
     voltage: r.battery_voltage_v, current: r.battery_current_a, soc: r.battery_soc,
     solar: r.solar_available === false ? null : r.pv_power_w, load: r.load_power_w,
   }));
+  const sourceActive: Record<DatasetKey, boolean> = { dc_live: esp.state === "open", ac_live: ac.state === "open", dc_sim: !live, ac_sim: acSim };
 
   const solarCard = (label: string, v: number | null | undefined, d: number, u: string): [string, string, string | undefined, [Tone, string]] =>
     solarOk ? [label, f(v, d, u), undefined, measured] : [label, "Unavailable", "Verification pending — not shown as measured", ["pending", "Pending"]];
@@ -559,7 +703,6 @@ export default function Dashboard() {
     },
   ];
 
-  const liveCount = liveRows.length + acLive.length, simCount = demoRows.length + acSimRows.length;
   const connectBtn = "rounded-full bg-white px-5 py-2.5 font-medium text-night disabled:opacity-60";
   return (
     <MotionConfig reducedMotion="user">
@@ -630,14 +773,9 @@ export default function Dashboard() {
                   sim={acSim} setSim={setAcSim} simBulb={acSimBulb} setSimBulb={setAcSimBulb} cal={cal} onCal={updateCal} liveRows={acLive} />
               </div>
 
-              <div className="mt-5 flex flex-wrap items-center gap-3">
-                <button className="rounded-full bg-white/10 px-5 py-2 text-sm disabled:opacity-40" disabled={!liveCount} onClick={() => download("live")}>
-                  Download live sensor CSV ({liveRows.length} DC · {acLive.length} AC)
-                </button>
-                <button className="rounded-full bg-white/10 px-5 py-2 text-sm disabled:opacity-40" disabled={!simCount} onClick={() => download("sim")}>
-                  Download simulated CSV ({demoRows.length} DC · {acSimRows.length} AC)
-                </button>
-                <span className="text-xs text-white/50">Live and simulated data are exported separately · live data stays downloadable after disconnecting · blank = unavailable</span>
+              <div className="mt-4">
+                <RecorderPanel r={recorder} active={sourceActive} imported={imported}
+                  onImported={(d) => { setImported(d); setChartView(d ? "imported" : "session"); }} />
               </div>
             </div>
           </div>
@@ -645,23 +783,34 @@ export default function Dashboard() {
 
         <div className="mx-auto max-w-[1200px] px-4 py-8 sm:px-8">
           <Panel>
-            <PanelTitle sub={live ? `Live ESP8266 readings only · last ${CHART_ROWS} samples · no generated values${dcStale ? ` · stale since ${lastDcTime}` : ""}` : `Current simulated session · last ${CHART_ROWS} samples · separate from the monthly synthetic analysis`}>
-              Session monitoring
+            <PanelTitle sub={showImported ? `Imported synthetic test file “${imported.name}” · ${imported.dcRows.toLocaleString()} DC rows · not measured, not mixed with live data`
+              : live ? `Live ESP8266 readings only · last ${CHART_ROWS} samples · no generated values${dcStale ? ` · stale since ${lastDcTime}` : ""}` : `Current simulated session · last ${CHART_ROWS} samples · separate from the monthly synthetic analysis`}>
+              {showImported ? "Imported synthetic data" : "Session monitoring"}
             </PanelTitle>
+            {imported && (
+              <div className="-mt-2 mb-4 flex flex-wrap gap-2 text-sm" role="group" aria-label="Chart data">
+                {(["session", "imported"] as const).map((v) => (
+                  <button key={v} onClick={() => setChartView(v)} aria-pressed={chartView === v}
+                    className={`rounded-full px-4 py-1.5 ring-1 ${chartView === v ? "bg-ink text-white ring-ink" : "ring-line text-muted"}`}>
+                    {v === "session" ? (live ? "Live session" : "Simulated session") : "Imported synthetic file"}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="grid gap-6 lg:grid-cols-2">
               <MiniChart title="Battery voltage" data={series} dataKey="voltage" color={C.battery} unit="V" limit={{ y: LOW_BATTERY_VOLTAGE_V, label: `Low ${LOW_BATTERY_VOLTAGE_V} V` }} />
               <MiniChart title="Battery current" data={series} dataKey="current" color={C.pred} unit="A" limit={{ y: MAX_CHARGE_CURRENT_A, label: `Max charge ${MAX_CHARGE_CURRENT_A} A` }} />
               <MiniChart title="Battery SOC (estimated)" data={series} dataKey="soc" color={C.battery} unit="%" domain={[0, 100]} limit={{ y: LOW_BATTERY_SOC, label: `Low ${LOW_BATTERY_SOC}%` }} />
-              <MiniChart title="Solar generation" data={series} dataKey="solar" color={C.solar} unit="W" note={solarOk ? undefined : "Gaps = solar unavailable / pending"} />
+              <MiniChart title="Solar generation" data={series} dataKey="solar" color={C.solar} unit="W" note={showImported ? "Synthetic" : solarOk ? undefined : "Gaps = solar unavailable / pending"} />
               <div className="lg:col-span-2">
-                <MiniChart title={s?.load_estimated ? "Estimated DC consumption" : "DC consumption"} data={series} dataKey="load" color={C.grid} unit="W" note={s?.load_estimated ? "Estimated by firmware" : undefined} />
+                <MiniChart title={showImported ? "DC consumption (synthetic)" : s?.load_estimated ? "Estimated DC consumption" : "DC consumption"} data={series} dataKey="load" color={C.grid} unit="W" note={showImported ? undefined : s?.load_estimated ? "Estimated by firmware" : undefined} />
               </div>
             </div>
-            <div className="mt-6 grid gap-4 border-t border-line pt-4 text-sm sm:grid-cols-3">
+            {!showImported && <div className="mt-6 grid gap-4 border-t border-line pt-4 text-sm sm:grid-cols-3">
               <div>Solar energy{totals.solarFromFirmware ? " (counter)" : " (retained samples)"}<br /><b className="font-mono text-xl">{f(totals.solar, 4, "Wh")}</b></div>
               <div>DC load energy{s?.load_estimated ? " (estimated)" : ""}<br /><b className="font-mono text-xl">{totals.consumed === null ? "Unavailable" : f(totals.consumed, 4, "Wh")}</b></div>
               <div>Grid-only equivalent @ ₹{tariff}/kWh<br /><b className="font-mono text-xl">{totals.consumed === null ? "Unavailable" : "₹" + ((totals.consumed * tariff) / 1000).toFixed(5)}</b></div>
-            </div>
+            </div>}
           </Panel>
         </div>
 
@@ -674,7 +823,7 @@ export default function Dashboard() {
         </div>
       </main>
       <footer className="bg-night px-8 py-8 text-sm text-white/60">
-        Smart Energy Management System · Prototype companion · <button onClick={() => download(live ? "live" : "sim")} className="underline">Download {live ? "live sensor" : "simulated"} CSV</button>
+        Smart Energy Management System · Prototype companion · <a href="#recorder" className="underline">Data recording &amp; CSV export</a>
       </footer>
     </MotionConfig>
   );
